@@ -1,6 +1,6 @@
 # Findings
 
-Each entry below documents one security finding against this gateway: the invariant it broke, how to reproduce it, and the fix that closes it. See the [README](README.md) for a summary table and how to run the gateway.
+Each entry below documents one security finding against this gateway: the invariant it broke, and the fix that closes it, with before/after evidence. See the [README](README.md) for a summary table and how to run the gateway.
 
 ---
 
@@ -28,23 +28,6 @@ Captured against the live deployment, after the fix — the same request now rej
 
 ![Unauthenticated request to /openapi.json now rejected](assets/screenshots/1_fixed.png)
 
-**Reproduction**
-
-Before the fix, both routes were open to anyone:
-
-```sh
-curl -s -o /dev/null -w "%{http_code}\n" "<gateway-url>/openapi.json"   # 200
-curl -s -o /dev/null -w "%{http_code}\n" "<gateway-url>/docs"           # 200
-```
-
-After the fix, on a fresh checkout, the same requests are rejected:
-
-```sh
-curl -s -o /dev/null -w "%{http_code}\n" "<gateway-url>/openapi.json"   # 401 (no token)
-curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer <install-token>" "<gateway-url>/openapi.json"  # 404 (route not even registered)
-curl -s -o /dev/null -w "%{http_code}\n" "<gateway-url>/healthz"        # 200 (stays public — liveness check only)
-```
-
 <!--
 ## N. <finding title>
 
@@ -58,8 +41,5 @@ What's wrong and how it could be exploited.
 Why the code ended up this way — the underlying design or assumption that let the problem in.
 
 **Solution:**
-How we fixed it — what changed, and the file(s) touched.
-
-**Reproduction**
-Before/after commands or evidence showing the attack fails post-fix.
+How we fixed it — what changed, and the file(s) touched. Include before/after screenshots or command output here to show the fix working.
 -->
