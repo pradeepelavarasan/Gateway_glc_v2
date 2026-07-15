@@ -12,8 +12,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT.parent / ".env")  # repo .env, if present
@@ -33,6 +33,16 @@ from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
+
+# Off unless explicitly opted into (e.g. GLC_ENABLE_DOCS=1 for local dev).
+# Production deployments never set this, so the schema route isn't even
+# registered there (a probe gets 404, not a 401 confirming it exists).
+DOCS_ENABLED = os.getenv("GLC_ENABLE_DOCS", "0") == "1"
+
+# Paths reachable without the install token. Keep this list minimal: healthz
+# leaks nothing beyond {"ok": true} and is the conventional liveness-check
+# exception for cloud platforms.
+PUBLIC_PATHS = {"/healthz"}
 
 
 def _install_sighup_reload() -> None:
@@ -73,7 +83,33 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="GLC v1 — Gateway for LLMs and Channels", lifespan=lifespan)
+app = FastAPI(
+    title="GLC v1 — Gateway for LLMs and Channels",
+    lifespan=lifespan,
+    docs_url="/docs" if DOCS_ENABLED else None,
+    redoc_url="/redoc" if DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if DOCS_ENABLED else None,
+)
+
+
+@app.middleware("http")
+async def require_install_token(request: Request, call_next):
+    """Every HTTP route requires the per-installation token, except the
+    public-path allowlist above. Channel adapters authenticate separately
+    at the websocket handshake (glc/routes/channels.py); this middleware
+    only sees HTTP-scope requests."""
+    if request.url.path not in PUBLIC_PATHS:
+        expected = get_or_create_install_token()
+        authorization = request.headers.get("authorization")
+        if not authorization or not authorization.startswith("Bearer "):
+            return JSONResponse(
+                {"detail": "missing bearer token (Authorization: Bearer <install_token>)"},
+                status_code=401,
+            )
+        if authorization.removeprefix("Bearer ").strip() != expected:
+            return JSONResponse({"detail": "install token mismatch"}, status_code=403)
+    return await call_next(request)
+
 
 app.include_router(chat_route.router)
 app.include_router(transcribe_route.router)
@@ -84,11 +120,12 @@ app.include_router(channels_route.router)
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
+    docs_line = "<p>Open <code>/docs</code> for the OpenAPI explorer.</p>" if DOCS_ENABLED else ""
     return (
         "<html><body style='font-family:sans-serif;max-width:680px;margin:2em auto'>"
         "<h1>GLC v1</h1>"
         "<p>Gateway for LLMs and Channels — Session 11 scaffold.</p>"
-        "<p>Open <code>/docs</code> for the OpenAPI explorer.</p>"
+        f"{docs_line}"
         "<p>Channel adapters connect over <code>WS /v1/channels/&lt;name&gt;</code>."
         " V9 callers should point at this port unchanged: chat, vision, embed,"
         " batch, cost-by-agent, providers, capabilities, status, calls."

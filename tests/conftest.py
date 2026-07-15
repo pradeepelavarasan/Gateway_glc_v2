@@ -7,7 +7,15 @@ are rolled fresh.
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# glc.main's FastAPI app fixes its docs_url/openapi_url at import time, so
+# this must be set before glc.main is imported anywhere (including by the
+# app_client fixture below) for the openapi.json-based route-registration
+# tests to see the schema.
+os.environ.setdefault("GLC_ENABLE_DOCS", "1")
 
 
 @pytest.fixture(autouse=True)
@@ -40,12 +48,15 @@ def _isolated_glc_state(monkeypatch, tmp_path):
 
 @pytest.fixture
 def app_client():
-    """TestClient pointed at a freshly-booted glc.main:app."""
+    """TestClient pointed at a freshly-booted glc.main:app, carrying the
+    install token by default since every route now requires it."""
     from fastapi.testclient import TestClient
 
     import glc.main as m
+    from glc.config import install_token_path
 
     with TestClient(m.app) as c:
+        c.headers["Authorization"] = f"Bearer {install_token_path().read_text().strip()}"
         yield c
 
 

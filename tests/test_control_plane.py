@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 def test_pair_without_token_is_unauthorized(app_client):
+    del app_client.headers["Authorization"]  # app_client carries a valid token by default
     r = app_client.post("/v1/control/pair", json={"channel": "telegram", "channel_user_id": "1"})
     assert r.status_code == 401
 
