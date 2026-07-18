@@ -21,7 +21,8 @@ Below is the list of issues that have been fixed so far. For the full write-up o
 
 | # | Issue | Fix |
 |---|-------|-----|
-| 1 | Public API schema (full route map) | `/docs` and `/openapi.json` disabled by default; every route now requires the install token except `/healthz` |
+| 1 | Unauthenticated reads (schema, status, providers, capabilities) | `/docs` and `/openapi.json` disabled by default; every route now requires the install token except `/healthz` |
+| 2 | SSRF via the image URL resolver | Image URLs are validated before fetch — internal/private/loopback ranges blocked (IPv4 + IPv6), redirects re-checked, connection pinned to the resolved IP, plus an optional host allowlist |
 
 ## Run it locally
 

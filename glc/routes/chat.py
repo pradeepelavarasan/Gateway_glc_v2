@@ -290,20 +290,49 @@ async def _resolve_image_urls(messages):
 
     import httpx as _httpx
 
+    from glc.security.ssrf import BlockedURLError, resolve_validated
+
+    _MAX_REDIRECTS = 5
+
     async def _fetch_to_data_url(url: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
             "Accept": "image/*,*/*;q=0.8",
         }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
-            try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+        # Follow redirects manually so the SSRF guard re-checks every hop; an
+        # allowed public URL must not be able to 302 into an internal address.
+        async with _httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as c:
+            current = url
+            for _ in range(_MAX_REDIRECTS + 1):
+                try:
+                    target = await resolve_validated(current)
+                except BlockedURLError as e:
+                    raise HTTPException(400, f"blocked image url {current!r}: {e}")
+                # Connect straight to the validated IP so there is no second DNS
+                # lookup a rebinding attack could poison; keep the Host header and
+                # (for https) the SNI/cert hostname as the original host.
+                orig = _httpx.URL(current)
+                pinned = orig.copy_with(host=target.ip)
+                req_headers = {"Host": orig.netloc.decode("ascii")}
+                extensions = {"sni_hostname": target.host} if target.scheme == "https" else {}
+                try:
+                    r = await c.get(pinned, headers=req_headers, extensions=extensions)
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {current!r}: {e}")
+                if r.is_redirect:
+                    loc = r.headers.get("location")
+                    if not loc:
+                        raise HTTPException(400, f"redirect with no location from {current!r}")
+                    current = str(orig.join(loc))
+                    continue
+                try:
+                    r.raise_for_status()
+                except _httpx.HTTPError as e:
+                    raise HTTPException(400, f"failed to fetch image url {current!r}: {e}")
+                mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
+                b64 = base64.b64encode(r.content).decode()
+                return f"data:{mt};base64,{b64}"
+            raise HTTPException(400, f"too many redirects fetching image url {url!r}")
 
     out = []
     for m in messages:

@@ -39,7 +39,15 @@ image = (
         "websockets>=12.0",
         "twilio>=9.0",
     )
-    .env({"GLC_CONFIG_DIR": "/data/glc"})
+    .env(
+        {
+            "GLC_CONFIG_DIR": "/data/glc",
+            # The image-URL resolver always blocks internal/private/loopback
+            # addresses. To additionally restrict it to a fixed set of hosts,
+            # set GLC_IMAGE_URL_ALLOWLIST to a comma-separated host list here
+            # (opt-in; off by default so any public host is fetchable).
+        }
+    )
     .add_local_dir(str(LOCAL_GLC), remote_path="/root/glc")
 )
 
