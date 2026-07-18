@@ -6,10 +6,10 @@ Each entry below documents one security finding against this gateway: the invari
 
 ## 1. Unauthenticated reads and actions (full route map, config disclosure, LLM abuse)
 
-**Invariant broken:**
+#### Invariant broken
 Nothing on the gateway should be reachable — or even discoverable — without the per-installation token. A stranger with only the URL should learn nothing about what routes exist, and should not be able to act on any of them.
 
-**What's the problem?**
+#### What's the problem?
 - **Recon: full route map** — the OpenAPI schema (`/openapi.json`) and interactive docs (`/docs`) were served publicly, giving anyone who found the URL a full blueprint of every route, method, and schema before sending a single real request.
 - **Config disclosure** (`/v1/status`, `/v1/providers`, `/v1/capabilities`) — these read endpoints answered with no authentication, revealing the provider order, the model behind each provider, and the exact `rpm`/`rpd`/`tpm` rate limits.
 - **Unauthenticated LLM abuse** (`/v1/chat`) — the chat endpoint itself accepted requests from anyone with no token at all, so a stranger could run up LLM provider usage and cost with no credential.
@@ -18,10 +18,10 @@ One before-fix capture stands in as the example for all three: the full, unauthe
 
 ![Unauthenticated /openapi.json response before the fix](assets/screenshots/1_issue.png)
 
-**Root cause:**
+#### Root cause
 All three trace back to the same human oversight: only two route groups (the control plane and the channel websocket handshake) were ever given a per-installation token check. The schema, the config reads, and the chat endpoint itself were written before there was any gateway-wide authentication to fall back on, so nobody added a check to them individually.
 
-**Solution:**
+#### Solution
 One fix closes all three, since it applies to every route rather than each one individually:
 - **Recon: full route map** — `docs_url`, `redoc_url`, and `openapi_url` now only register when `GLC_ENABLE_DOCS=1` is explicitly set. Deployments don't set it, so those routes don't exist at all — a request gets a plain `404`, not even a `401` that would confirm something's there.
 - **Config disclosure and unauthenticated LLM abuse** — one middleware now requires `Authorization: Bearer <install-token>` on every HTTP request except `/healthz`, instead of leaving auth to be remembered route-by-route. It reuses the same per-installation token already generated for the control plane and channel adapters, and covers `/v1/status`, `/v1/providers`, `/v1/capabilities`, and `/v1/chat` along with everything else.
@@ -53,10 +53,10 @@ curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer <install-toke
 
 ## 2. SSRF via the image URL resolver
 
-**Invariant broken:**
+#### Invariant broken
 The gateway must never fetch a caller-supplied URL that points at internal infrastructure. A caller must not be able to use the gateway as a proxy to reach addresses — loopback, private networks, cloud metadata — that they could not reach directly.
 
-**What's the problem?**
+#### What's the problem?
 Before calling the model, the gateway fetched any `http(s)` image URL supplied in a chat or vision request — server-side, following redirects, with no check on the destination. Two things were wrong:
 - **Internal targets were reachable.** A caller could point `image_url` at an internal address (loopback, the cloud-metadata endpoint `169.254.169.254`, private hosts) and the gateway would fetch it on their behalf. Even a URL that looked public could redirect into an internal address and still be followed.
 - **There was no way to limit destinations at all.** Beyond internal addresses, the resolver would fetch from *any* host on the public internet, with no notion of an approved list — an unbounded outbound surface (e.g. exfiltrating data to, or pulling arbitrary content from, a server the caller controls).
@@ -66,10 +66,10 @@ Reproduced against the live deployment: a probe pointing `image_url` at a caller
 ![Chat request pointing image_url at a caller-controlled webhook, before the fix](assets/screenshots/2_issue_1_terminal%20command.png)
 ![webhook.site logging the gateway's server-side fetch, identified by its GLCv1 user-agent](assets/screenshots/2_issue_webhook%20confirmation.png)
 
-**Root cause:**
+#### Root cause
 The image resolver (`glc/routes/chat.py`, `_fetch_to_data_url`) fetched the URL with httpx's automatic redirect following and no validation of the destination at all — neither a check that the host wasn't internal, nor any concept of an approved-destination list. It simply fetched whatever it was handed. Both `/v1/chat` and `/v1/vision` route through this single function, so the gap applied to both.
 
-**Solution:**
+#### Solution
 A new guard (`glc/security/ssrf.py`) validates every URL before it is fetched, and the resolver was rewritten to use it:
 - **Block internal ranges (always on).** The host is resolved and rejected if any resolved address is loopback, private, link-local, reserved, multicast, or unspecified — covering IPv4 and IPv6, including IPv4-mapped IPv6. Only `http`/`https` schemes are allowed.
 - **Re-check every redirect.** Automatic redirects are disabled; the resolver follows them manually and re-validates each hop, so an allowed public URL can't `302` into an internal address.
@@ -96,15 +96,15 @@ HTTP:400
 <!--
 ## N. <finding title>
 
-**Invariant broken:**
+#### Invariant broken
 Which security guarantee this violates.
 
-**What's the problem?**
+#### What's the problem?
 What's wrong and how it could be exploited.
 
-**Root cause:**
+#### Root cause
 Why the code ended up this way — the underlying design or assumption that let the problem in.
 
-**Solution:**
+#### Solution
 How we fixed it — what changed, and the file(s) touched. Include before/after screenshots or command output here to show the fix working.
 -->
