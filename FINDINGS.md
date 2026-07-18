@@ -10,10 +10,10 @@ Each entry below documents one security finding against this gateway: the invari
 Nothing on the gateway should be reachable — or even discoverable — without the per-installation token. A stranger with only the URL should learn nothing about what routes exist, and should not be able to act on any of them.
 
 #### What's the problem?
-- **Recon: full route map** — the OpenAPI schema (`/openapi.json`) and interactive docs (`/docs`) were served publicly, giving anyone who found the URL a full blueprint of every route, method, and schema before sending a single real request.
-- **Config disclosure** (`/v1/status`, `/v1/providers`, `/v1/capabilities`) — these read endpoints answered with no authentication, revealing the provider order, the model behind each provider, and the exact `rpm`/`rpd`/`tpm` rate limits.
-- **Unauthenticated LLM abuse** (`/v1/chat`) — the chat endpoint itself accepted requests from anyone with no token at all, so a stranger could run up LLM provider usage and cost with no credential.
-- **Usage and cost read** (`/v1/cost/by_agent`, `/v1/calls`) — usage and per-agent cost data was readable with no auth; empty on a fresh deploy, but it exposes activity once the gateway is in use.
+- **1.1 — Recon: full route map** — the OpenAPI schema (`/openapi.json`) and interactive docs (`/docs`) were served publicly, giving anyone who found the URL a full blueprint of every route, method, and schema before sending a single real request.
+- **1.2 — Config disclosure** (`/v1/status`, `/v1/providers`, `/v1/capabilities`) — these read endpoints answered with no authentication, revealing the provider order, the model behind each provider, and the exact `rpm`/`rpd`/`tpm` rate limits.
+- **1.3 — Unauthenticated LLM abuse** (`/v1/chat`) — the chat endpoint itself accepted requests from anyone with no token at all, so a stranger could run up LLM provider usage and cost with no credential.
+- **1.4 — Usage and cost read** (`/v1/cost/by_agent`, `/v1/calls`) — usage and per-agent cost data was readable with no auth; empty on a fresh deploy, but it exposes activity once the gateway is in use.
 
 One before-fix capture stands in as the example for all four: the full, unauthenticated `/openapi.json` response below lists `/v1/chat`, `/v1/status`, `/v1/providers`, `/v1/capabilities`, `/v1/cost/by_agent`, and `/v1/calls` right alongside every other route, method, and schema — confirming none of them needed a token at the time.
 
@@ -24,23 +24,21 @@ All four trace back to the same human oversight: only two route groups (the cont
 
 #### Solution
 One fix closes all four, since it applies to every route rather than each one individually:
-- **Recon: full route map** — `docs_url`, `redoc_url`, and `openapi_url` now only register when `GLC_ENABLE_DOCS=1` is explicitly set. Deployments don't set it, so those routes don't exist at all — a request gets a plain `404`, not even a `401` that would confirm something's there.
-- **Config disclosure, unauthenticated LLM abuse, and usage/cost read** — one middleware now requires `Authorization: Bearer <install-token>` on every HTTP request except `/healthz`, instead of leaving auth to be remembered route-by-route. It reuses the same per-installation token already generated for the control plane and channel adapters, and covers `/v1/status`, `/v1/providers`, `/v1/capabilities`, `/v1/chat`, `/v1/cost/by_agent`, and `/v1/calls` along with everything else.
+- **1.1 — Recon: full route map** — `docs_url`, `redoc_url`, and `openapi_url` now only register when `GLC_ENABLE_DOCS=1` is explicitly set. Deployments don't set it, so those routes don't exist at all — a request gets a plain `404`, not even a `401` that would confirm something's there.
+- **1.2–1.4 — Config disclosure, unauthenticated LLM abuse, and usage/cost read** — one middleware now requires `Authorization: Bearer <install-token>` on every HTTP request except `/healthz`, instead of leaving auth to be remembered route-by-route. It reuses the same per-installation token already generated for the control plane and channel adapters, and covers `/v1/status`, `/v1/providers`, `/v1/capabilities`, `/v1/chat`, `/v1/cost/by_agent`, and `/v1/calls` along with everything else.
 - Files touched: `glc/main.py`, `tests/conftest.py`, `tests/test_control_plane.py`.
 
-Captured against the live deployment, after the fix — the schema request and a config-read request are both rejected the same way:
+Proof after the fix, captured against the live deployment — one per sub-issue:
+
+**1.1 — `/openapi.json` / `/docs`** are no longer served; an unauthenticated request is rejected:
 
 ![Unauthenticated request to /openapi.json now rejected](assets/screenshots/1_fixed.png)
+
+**1.2 — config read (`/v1/status`)** now requires the token:
+
 ![Unauthenticated request to /v1/status now rejected](assets/screenshots/1_fixed_2.png)
 
-Terminal proof for the chat endpoint specifically — an unauthenticated chat request, now rejected before it reaches any provider:
-
-```console
-$ curl -s -X POST "https://pradeep-elavarasan--glc-v1-gateway-fastapi-app.modal.run/v1/chat" -H 'content-type: application/json' -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}'
-{"detail":"missing bearer token (Authorization: Bearer <install_token>)"}
-```
-
-Verified with the install token too, confirming authenticated callers still get through:
+Authenticated callers still get through, confirming the fix didn't break legitimate use:
 
 ```sh
 GATEWAY_URL="https://pradeep-elavarasan--glc-v1-gateway-fastapi-app.modal.run"
@@ -50,10 +48,24 @@ curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer <install-toke
 curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer <install-token>" "$GATEWAY_URL/v1/capabilities" # 200
 ```
 
-The usage/cost endpoints are gated the same way — an unauthenticated read is rejected:
+**1.3 — chat (`/v1/chat`)** rejects an unauthenticated request before it reaches any provider:
+
+```console
+$ curl -s -X POST "https://pradeep-elavarasan--glc-v1-gateway-fastapi-app.modal.run/v1/chat" -H 'content-type: application/json' -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}'
+{"detail":"missing bearer token (Authorization: Bearer <install_token>)"}
+```
+
+**1.4 — usage/cost read (`/v1/cost/by_agent`)** rejects an unauthenticated read:
 
 ```console
 $ curl -s "https://pradeep-elavarasan--glc-v1-gateway-fastapi-app.modal.run/v1/cost/by_agent"
+{"detail":"missing bearer token (Authorization: Bearer <install_token>)"}
+```
+
+**1.5 — Control plane (reference, already gated — nothing to fix)** — the control plane (`/v1/control/*`) already required the install token before this fix; it's the model the data-plane fix (1.1–1.4) now matches. Shown here as the contrast between a guarded and a (previously) unguarded endpoint:
+
+```console
+$ curl -s "https://pradeep-elavarasan--glc-v1-gateway-fastapi-app.modal.run/v1/control/presence"
 {"detail":"missing bearer token (Authorization: Bearer <install_token>)"}
 ```
 
