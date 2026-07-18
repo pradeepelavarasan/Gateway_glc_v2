@@ -86,7 +86,7 @@ async def resolve_validated(url: str) -> ValidatedTarget:
     try:
         infos = await loop.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
-        raise BlockedURLError(f"cannot resolve host {host!r}: {e}")
+        raise BlockedURLError(f"cannot resolve host {host!r}: {e}") from e
 
     safe: list[str] = []
     for info in infos:

@@ -24,6 +24,7 @@ Below is the list of issues that have been fixed so far. For the full write-up o
 | 1 | Unauthenticated reads (schema, status, providers, capabilities, usage/cost) | `/docs` and `/openapi.json` disabled by default; every route now requires the install token except `/healthz` |
 | 2 | SSRF via the image URL resolver | Image URLs are validated before fetch — internal/private/loopback ranges blocked (IPv4 + IPv6), redirects re-checked, connection pinned to the resolved IP, plus an optional host allowlist |
 | 3 | Verbose upstream errors | Provider failures return a generic message to the client; the raw upstream detail (provider, endpoint, response body) is kept in server-side logs only |
+| 4 | Provider keys readable by any in-process code | Keys isolated in a separate broker container; the gateway holds none and delegates each call via a short-lived, provider-scoped capability token |
 
 ## Run it locally
 
@@ -42,13 +43,13 @@ curl -H "Authorization: Bearer $(cat ~/.glc/install_token)" localhost:8111/v1/pr
 
 ## Deploy it on Modal
 
-The gateway ships with a Modal wrapper (`modal_app.py`) that builds the container image, mounts a persistent volume for its databases, and injects provider keys as a secret. Use mock keys only — never put real provider keys on Modal.
+The gateway ships with a Modal wrapper (`modal_app.py`) that deploys two isolated containers: a **broker** that holds the provider keys, and the public **gateway**, which holds none (see Fixed issue #4). Use mock keys only — never put real provider keys on Modal.
 
 ```sh
 # one-time: authenticate the CLI with your Modal account
 uv run modal token new
 
-# one-time: create the secret the wrapper expects, with mock values
+# one-time: the provider keys — mounted only into the broker container. Mock values.
 uv run modal secret create glc-llm-keys \
   CEREBRAS_API_KEY=mock-cerebras-key \
   GEMINI_API_KEY=mock-gemini-key \
@@ -57,11 +58,18 @@ uv run modal secret create glc-llm-keys \
   NVIDIA_API_KEY=mock-nvidia-key \
   OPEN_ROUTER_API_KEY=mock-openrouter-key
 
+# one-time: the broker-signing key the gateway uses to mint capability tokens
+uv run modal secret create glc-broker-sign \
+  GLC_BROKER_SIGN_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+
 # deploy (the data volume is created automatically on first deploy)
 uv run modal deploy modal_app.py
 
 # confirm it's live
 curl <deployment-url>/healthz
+
+# confirm the isolation: the gateway container holds no provider keys
+uv run modal run modal_app.py::check_gateway_env
 ```
 
 The deployment scales to zero when idle, so it stays free-tier by default.

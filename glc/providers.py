@@ -1220,3 +1220,62 @@ def build_router_providers():
     if k := os.getenv("GITHUB_ACCESS_TOKEN"):
         out["github"] = GitHubProvider(k, os.getenv("ROUTER_GITHUB_MODEL", ROUTER_DEFAULTS["github"]))
     return out
+
+
+class ProxyProvider:
+    """Keyless stand-in for a provider in the gateway.
+
+    Carries the metadata the router needs (name, model, capabilities) but holds
+    no API key: the actual call is delegated to the broker, which is the only
+    component with the provider keys. Matches the BaseProvider.chat/stream shape.
+    """
+
+    def __init__(self, name: str, model: str, capabilities: dict, broker, kind: str):
+        self.name = name
+        self.model = model
+        self.capabilities = dict(capabilities or {})
+        self._broker = broker
+        self._kind = kind
+
+    async def chat(
+        self,
+        messages,
+        *,
+        max_tokens=2048,
+        temperature=0.7,
+        model=None,
+        tools=None,
+        tool_choice=None,
+        reasoning=None,
+        response_format=None,
+        system_blocks=None,
+        cache_system=False,
+    ) -> dict:
+        payload = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "model": model,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "reasoning": reasoning,
+            "response_format": response_format,
+            "system_blocks": system_blocks,
+            "cache_system": cache_system,
+        }
+        return await self._broker.call(self._kind, payload, provider=self.name)
+
+    async def stream(self, messages, **kwargs):
+        # Streaming through the broker is buffered: fetch the full result and
+        # emit it once. Incremental streaming-through-broker is a follow-up.
+        result = await self.chat(messages, **kwargs)
+        yield result.get("text", "")
+
+
+async def build_proxy_providers(broker, kind: str = "chat_worker") -> dict:
+    """Build keyless ProxyProviders for whatever the broker reports it can serve."""
+    descriptors = await broker.enabled(kind)
+    return {
+        d["name"]: ProxyProvider(d["name"], d["model"], d.get("capabilities", {}), broker, kind)
+        for d in descriptors
+    }

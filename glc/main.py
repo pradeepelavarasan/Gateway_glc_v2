@@ -19,7 +19,6 @@ ROOT = Path(__file__).parent
 load_dotenv(ROOT.parent / ".env")  # repo .env, if present
 
 from glc import db  # noqa: E402
-from glc import embedders as E  # noqa: E402
 from glc import providers as P  # noqa: E402
 from glc.audit import init_store as init_audit  # noqa: E402
 from glc.cache import GeminiCache  # noqa: E402
@@ -31,6 +30,7 @@ from glc.routes import control as control_route  # noqa: E402
 from glc.routes import speak as speak_route  # noqa: E402
 from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
+from glc.security.broker import build_broker  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
 
@@ -73,11 +73,15 @@ async def lifespan(app: FastAPI):
     get_or_create_install_token()
     _install_sighup_reload()
     app.state.cache = GeminiCache(ttl_seconds=300)
-    app.state.providers = P.build_providers(app.state.cache)
+    # Provider keys live only in the broker; the gateway builds keyless proxy
+    # providers and delegates every keyed call to it (see glc/security/broker.py).
+    app.state.broker = build_broker(app.state.cache)
+    app.state.providers = await P.build_proxy_providers(app.state.broker, "chat_worker")
     app.state.router = Router(app.state.providers, chat_route.ORDER)
-    app.state.router_providers = P.build_router_providers()
+    app.state.router_providers = await P.build_proxy_providers(app.state.broker, "chat_router")
     app.state.router_pool = RouterPool(app.state.router_providers, chat_route.ROUTER_ORDER)
-    app.state.embedders, app.state.embed_order = E.build_embedders()
+    app.state.embed_descriptors = await app.state.broker.enabled("embed")
+    app.state.embed_order = [d["name"] for d in app.state.embed_descriptors]
     app.state.started_at = time.time()
     app.state.registered_channels = []
     yield

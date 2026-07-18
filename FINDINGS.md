@@ -151,6 +151,65 @@ The full detail is still captured, but only in the server-side logs (visible via
 upstream error [502]: gemini failed: gemini HTTP 400: {... "service": "generativelanguage.googleapis.com" ...}
 ```
 
+---
+
+## 4. Provider keys readable by any in-process code (dump every provider key)
+
+#### Invariant broken
+A provider API key is a gateway-only secret. No component that merely runs *inside* the gateway process — a channel adapter, a voice adapter, a tool — should be able to read it.
+
+#### What's the problem?
+Every provider key is injected into the gateway container's environment, and the gateway reads them from `os.environ`. But wrapping the monolith on Modal put the whole gateway — providers, channel adapters, voice adapters, tools — in one container sharing one secret, so any code in the process can read every key straight from `os.environ`. The keys are not isolated from the components that should never hold them.
+
+Reproduced from a fresh checkout (`repro/leak1_provider_keys.py`) — the gateway boots, then a stand-in adapter running in the same process dumps every key (mock values, per the assignment's mock-keys rule):
+
+```console
+$ uv run python repro/leak1_provider_keys.py
+[gateway] booted; worker providers loaded: ['cerebras', 'gemini', 'github', 'groq', 'nvidia', 'openrouter']
+
+[adapter] running inside the gateway process — dumping every provider key:
+    GEMINI_API_KEY = gmni...   <-- adapter read the gateway's secret
+    GROQ_API_KEY = gsk_...   <-- adapter read the gateway's secret
+    NVIDIA_API_KEY = nvap...   <-- adapter read the gateway's secret
+    CEREBRAS_API_KEY = csk-...   <-- adapter read the gateway's secret
+    OPEN_ROUTER_API_KEY = sk-o...   <-- adapter read the gateway's secret
+    GITHUB_ACCESS_TOKEN = ghp_...   <-- adapter read the gateway's secret
+```
+
+#### Root cause
+Provider keys live in `os.environ` for the lifetime of the gateway process, and every adapter shares that process. Move 1 (wrapping the monolith) delivered one container with one shared secret, so the environment that holds the keys is the same environment every component runs in — there is no boundary between "code that makes provider calls" and "code that should never see a key."
+
+#### Solution
+Provider keys now live only in an isolated **broker** container. The gateway — and every channel/voice adapter and tool running in it — has **no** provider keys; it holds only a broker-signing secret. Every keyed call (chat, routing, embedding, speech-to-text, text-to-speech) is delegated to the broker: the gateway mints a **short-lived, provider-scoped capability token**, the broker verifies it, makes the one upstream call, and returns the result. This is the "per-slot secret + per-tool credential issuance" the finding calls for — an adapter in the gateway can no longer read a provider key because there is none in its environment.
+
+- `glc/security/capabilities.py` (new) — mint/verify short-lived, provider-scoped HMAC tokens.
+- `glc/security/broker.py` (new) — `Broker` with `InProcessBroker` (runs the keyed call where the keys live) and `RemoteBroker` (gateway → broker Modal function, minting a token per call).
+- `glc/providers.py` — `ProxyProvider`/`build_proxy_providers`: the gateway builds keyless proxies that delegate to the broker.
+- `glc/main.py`, `glc/routes/chat.py`, `glc/routes/transcribe.py`, `glc/routes/speak.py` — route every keyed call through the broker.
+- `modal_app.py` — split into `broker_exec` (holds `glc-llm-keys`) and the gateway `fastapi_app` (holds only `glc-broker-sign`, **no** provider keys).
+- `tests/test_broker_isolation.py` (new).
+
+After the fix — the same snippet run inside each Modal container. The **gateway** container (where adapters run) has no provider keys; the **broker** container is the only place they exist:
+
+```console
+$ modal run modal_app.py::check_gateway_env
+[gateway container] provider keys present:
+    GEMINI_API_KEY = False
+    GROQ_API_KEY = False
+    NVIDIA_API_KEY = False
+    CEREBRAS_API_KEY = False
+    OPEN_ROUTER_API_KEY = False
+    GITHUB_ACCESS_TOKEN = False
+
+$ modal run modal_app.py::check_broker_env
+[broker container] provider keys present:
+    GEMINI_API_KEY = True
+    GROQ_API_KEY = True
+    ... (keys live only in the broker)
+```
+
+The gateway still works — `/v1/chat` on the keyless gateway delegates to the broker and reaches the provider (failing only on the mock key, as before), confirming the isolation didn't break the data plane.
+
 <!--
 ## N. <finding title>
 

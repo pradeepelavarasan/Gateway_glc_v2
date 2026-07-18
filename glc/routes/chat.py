@@ -715,8 +715,7 @@ async def embed(req: EmbedRequest, request: Request):
     from glc import embedders as E
 
     state = request.app.state
-    embedders = state.embedders
-    if not embedders:
+    if not getattr(state, "embed_descriptors", None):
         raise HTTPException(503, "no embedding providers configured")
     if len(req.text) > E.MAX_INPUT_CHARS:
         raise HTTPException(
@@ -726,12 +725,11 @@ async def embed(req: EmbedRequest, request: Request):
         )
     t0 = time.time()
     try:
-        name, result, attempts, latency = await E.embed_with_failover(
-            embedders,
-            req.text,
-            req.task_type,
-            explicit=req.provider,
+        out = await state.broker.call(
+            "embed",
+            {"text": req.text, "task_type": req.task_type, "explicit": req.provider},
         )
+        name, result, attempts, latency = out["name"], out["result"], out["attempts"], out["latency"]
     except E.EmbedderError as e:
         latency = int((time.time() - t0) * 1000)
         db.log_call(

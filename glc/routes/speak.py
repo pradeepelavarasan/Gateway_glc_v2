@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from glc.routes.errors import upstream_error
-from glc.voice.tts import TTSError, synthesize
+from glc.voice.tts import TTSError
 
 router = APIRouter()
 
@@ -29,9 +29,11 @@ class SpeakResponse(BaseModel):
 
 
 @router.post("/v1/speak", response_model=SpeakResponse)
-async def speak_route(req: SpeakRequest):
+async def speak_route(req: SpeakRequest, request: Request):
     try:
-        r = await synthesize(req.text, voice_id=req.voice_id, prefer=req.prefer)
+        r = await request.app.state.broker.call(
+            "tts", {"text": req.text, "voice_id": req.voice_id, "prefer": req.prefer}
+        )
     except TTSError as e:
         raise upstream_error(
             e.status or 502,
