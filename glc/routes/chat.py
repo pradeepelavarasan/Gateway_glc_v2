@@ -35,6 +35,7 @@ from glc.llm_schemas import (
     ToolCall,
     VisionRequest,
 )
+from glc.routes.errors import upstream_error
 from glc.routing import DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS
 
 DEFAULT_ORDER = ["ollama", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github"]
@@ -634,7 +635,7 @@ async def chat(req: ChatRequest, request: Request):
                 tag += f" → backoff {secs:.0f}s ({reason})"
             all_attempts.append({"provider": name, "reason": tag})
             if explicit_override or not getattr(e, "retryable", True):
-                raise HTTPException(502, f"{name} failed: {e}")
+                raise upstream_error(502, log_detail=f"{name} failed: {e}")
             candidates = [c for c in candidates if c != name]
             continue
         except HTTPException:
@@ -659,11 +660,15 @@ async def chat(req: ChatRequest, request: Request):
             )
             all_attempts.append({"provider": name, "reason": f"exception: {str(e)[:120]}"})
             if explicit_override:
-                raise HTTPException(502, f"{name} failed: {e}")
+                raise upstream_error(502, log_detail=f"{name} failed: {e}")
             candidates = [c for c in candidates if c != name]
             continue
 
-    raise HTTPException(503, f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}")
+    raise upstream_error(
+        503,
+        log_detail=f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}",
+        client_detail="all upstream providers are currently unavailable",
+    )
 
 
 @router.post("/v1/chat/batch")
@@ -741,11 +746,23 @@ async def embed(req: EmbedRequest, request: Request):
         )
         if req.provider:
             if e.status == 429:
-                raise HTTPException(429, f"{req.provider} rate-limited: {e}")
+                raise upstream_error(
+                    429,
+                    log_detail=f"{req.provider} rate-limited: {e}",
+                    client_detail="upstream provider rate limit reached; retry later",
+                )
             if e.status == 400:
-                raise HTTPException(400, str(e))
-            raise HTTPException(502, f"{req.provider} embed failed: {e}")
-        raise HTTPException(503, str(e))
+                raise upstream_error(
+                    400,
+                    log_detail=f"{req.provider} embed 400: {e}",
+                    client_detail="embedding request was rejected by the upstream provider",
+                )
+            raise upstream_error(502, log_detail=f"{req.provider} embed failed: {e}")
+        raise upstream_error(
+            503,
+            log_detail=f"embed: all providers unavailable: {e}",
+            client_detail="all upstream providers are currently unavailable",
+        )
 
     db.log_call(
         provider=name,

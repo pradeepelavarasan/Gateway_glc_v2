@@ -93,6 +93,44 @@ $ curl -s -w "\nHTTP:%{http_code}\n" -X POST "$GATEWAY_URL/v1/chat" -H "Authoriz
 HTTP:400
 ```
 
+---
+
+## 3. Verbose upstream errors
+
+#### Invariant broken
+An error returned to the client must not reveal internal implementation detail — which upstream provider was used, its endpoint, or its raw error response. That detail belongs in server-side logs only.
+
+#### What's the problem?
+When an upstream provider call failed, the gateway passed the provider's raw error straight back to the client: the provider name (`gemini`), the upstream HTTP status, the full upstream error body, and the upstream endpoint (`generativelanguage.googleapis.com`). That hands an attacker a free map of the gateway's backends and their infrastructure before probing anything.
+
+```console
+$ curl -s -w "\nHTTP:%{http_code}\n" -X POST "$GATEWAY_URL/v1/chat" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}'
+{"detail":"gemini failed: gemini HTTP 400: {\n  \"error\": {\n    \"code\": 400,\n    \"message\": \"API key not valid. Please pass a valid API key.\",\n    \"status\": \"INVALID_ARGUMENT\",\n    \"details\": [\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\",\n        \"reason\": \"API_KEY_INVALID\",\n        \"domain\": \"googleapis.com\",\n        \"metadata\": {\n          \"service\": \"generativelanguage.googleapis.com\"\n        }\n      },\n      {\n   "}
+HTTP:502
+```
+
+#### Root cause
+Several route handlers built their client-facing error by interpolating the raw provider error directly — e.g. `raise HTTPException(502, f"{name} failed: {e}")`. The full detail was already recorded server-side (the audit log), but it was *also* echoed back to the caller. The same pattern was present across `/v1/chat`, `/v1/embed`, `/v1/transcribe`, and `/v1/speak`.
+
+#### Solution
+A shared helper (`glc/routes/errors.py`, `upstream_error`) now logs the full upstream detail server-side and returns a generic message to the client. Every upstream-error site across the chat, embed, transcribe, and speak routes was switched to it, so no response names a provider, names an endpoint, or includes a raw upstream body. Client-input errors (malformed base64, unknown provider, oversized input) are left unchanged, since those describe the caller's own request rather than a backend.
+
+- Files touched: `glc/routes/errors.py` (new), `glc/routes/chat.py`, `glc/routes/transcribe.py`, `glc/routes/speak.py`, `tests/test_error_sanitization.py` (new).
+
+After the fix — the same request now gets a generic message with no provider, endpoint, or upstream body:
+
+```console
+$ curl -s -w "\nHTTP:%{http_code}\n" -X POST "$GATEWAY_URL/v1/chat" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"hi"}]}'
+{"detail":"upstream provider request failed"}
+HTTP:502
+```
+
+The full detail is still captured, but only in the server-side logs (visible via `modal app logs`):
+
+```text
+upstream error [502]: gemini failed: gemini HTTP 400: {... "service": "generativelanguage.googleapis.com" ...}
+```
+
 <!--
 ## N. <finding title>
 

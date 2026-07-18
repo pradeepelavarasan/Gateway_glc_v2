@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 
+from glc.routes.errors import upstream_error
 from glc.voice.tts import TTSError, synthesize
 
 router = APIRouter()
@@ -32,7 +33,11 @@ async def speak_route(req: SpeakRequest):
     try:
         r = await synthesize(req.text, voice_id=req.voice_id, prefer=req.prefer)
     except TTSError as e:
-        raise HTTPException(e.status or 502, str(e)) from e
+        raise upstream_error(
+            e.status or 502,
+            log_detail=f"speak failed: {e}",
+            client_detail="speech provider request failed",
+        ) from e
     return SpeakResponse(
         audio_b64=r.audio_b64,
         mime=r.mime,

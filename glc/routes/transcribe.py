@@ -8,6 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from glc.routes.errors import upstream_error
 from glc.voice.stt import STTError, transcribe
 
 router = APIRouter()
@@ -39,7 +40,11 @@ async def transcribe_route(req: TranscribeRequest):
     except STTError as e:
         if req.prefer == "streaming":
             raise HTTPException(400, str(e)) from e
-        raise HTTPException(e.status or 502, str(e)) from e
+        raise upstream_error(
+            e.status or 502,
+            log_detail=f"transcribe failed: {e}",
+            client_detail="transcription provider request failed",
+        ) from e
     return TranscribeResponse(
         text=r.text,
         language=r.language,

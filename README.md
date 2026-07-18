@@ -23,6 +23,7 @@ Below is the list of issues that have been fixed so far. For the full write-up o
 |---|-------|-----|
 | 1 | Unauthenticated reads (schema, status, providers, capabilities) | `/docs` and `/openapi.json` disabled by default; every route now requires the install token except `/healthz` |
 | 2 | SSRF via the image URL resolver | Image URLs are validated before fetch — internal/private/loopback ranges blocked (IPv4 + IPv6), redirects re-checked, connection pinned to the resolved IP, plus an optional host allowlist |
+| 3 | Verbose upstream errors | Provider failures return a generic message to the client; the raw upstream detail (provider, endpoint, response body) is kept in server-side logs only |
 
 ## Run it locally
 
