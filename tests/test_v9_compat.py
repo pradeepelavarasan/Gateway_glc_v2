@@ -66,6 +66,14 @@ def test_v1_cost_by_agent_returns_dict(app_client):
     assert isinstance(body, dict)
 
 
+def test_usage_and_cost_endpoints_require_auth(app_client):
+    # Usage/cost endpoints expose per-agent activity and must not be readable
+    # without the install token (see FINDINGS.md, Finding 1).
+    del app_client.headers["Authorization"]
+    for path in ("/v1/cost/by_agent", "/v1/calls"):
+        assert app_client.get(path).status_code == 401, f"{path} was readable without a token"
+
+
 def test_chat_request_rejects_bad_provider(app_client):
     r = app_client.post("/v1/chat", json={"prompt": "hi", "provider": "no_such_provider"})
     # If no providers wired at all, the validation hits 400; if they are
