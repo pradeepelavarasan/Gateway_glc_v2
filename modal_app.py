@@ -51,6 +51,7 @@ gateway_image = _base.env({"GLC_CONFIG_DIR": "/data/glc", "GLC_BROKER": "remote"
 data_volume = modal.Volume.from_name("glc-data", create_if_missing=True)
 llm_secret = modal.Secret.from_name("glc-llm-keys")  # provider keys — broker only
 sign_secret = modal.Secret.from_name("glc-broker-sign")  # token-signing key — both
+install_token_secret = modal.Secret.from_name("glc-install-token")  # control token — gateway only
 
 
 # ── broker: the only container that holds provider keys ──────────────────────
@@ -90,7 +91,8 @@ async def broker_exec(kind: str, payload: dict, provider: str | None = None, tok
 @app.function(
     image=gateway_image,
     volumes={"/data": data_volume},
-    secrets=[sign_secret],  # broker-signing key only; NO provider keys
+    # broker-signing key + the install token as a Secret (never a file); NO provider keys
+    secrets=[sign_secret, install_token_secret],
     min_containers=0,  # scale to zero when idle -> protects the free tier
 )
 @modal.asgi_app()
@@ -141,3 +143,36 @@ def check_broker_env() -> dict:
     for k, v in present.items():
         print(f"    {k} = {v}")
     return present
+
+
+@app.function(image=gateway_image, volumes={"/data": data_volume}, secrets=[sign_secret, install_token_secret])
+def check_inprocess_fixes() -> dict:
+    """Runs the leak-2 and leak-4 repros INSIDE the gateway container (the same
+    process an in-process attacker would have) to prove the fixes on deploy."""
+    import os
+
+    os.makedirs("/data/glc", exist_ok=True)
+
+    # leak 4 — the install-token file must not exist (bound as a Secret).
+    from glc.config import get_or_create_install_token, install_token_path
+
+    get_or_create_install_token()  # resolves from the Secret; removes any stale file
+    token_file_exists = install_token_path().exists()
+
+    # leak 2 — a DELETE is now detected by the hash chain.
+    from glc.audit import store as audit
+
+    audit.init_store()
+    audit.append(channel="t", channel_user_id="u", trust_level="owner_paired", event_type="e")
+    import sqlite3
+
+    con = sqlite3.connect(os.getenv("GLC_AUDIT_DB", os.path.expanduser("~/.glc/audit.sqlite")))
+    con.execute("DELETE FROM audit_log")
+    con.commit()
+    con.close()
+    chain = audit.verify_chain()
+
+    out = {"install_token_file_exists": token_file_exists, "audit_verify_after_delete": chain}
+    print("[gateway container] install_token file exists:", token_file_exists, " (expected False)")
+    print("[gateway container] audit verify after DELETE:", chain["ok"], "-", chain["reason"])
+    return out

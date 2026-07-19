@@ -210,6 +210,113 @@ $ modal run modal_app.py::check_broker_env
 
 The gateway still works — `/v1/chat` on the keyless gateway delegates to the broker and reaches the provider (failing only on the mock key, as before), confirming the isolation didn't break the data plane.
 
+---
+
+> The findings below are **in-process** leaks: not remote/HTTP attacks, but code running inside the gateway's own Python process (a malicious tool, or a compromised in-process adapter). They can't be reproduced with `curl` — the repro runs the snippet in the process. A single harness reproduces them from a fresh checkout: `uv run python repro/leak_inprocess.py`.
+
+## 5. Tamper-evident audit log
+
+#### Invariant broken
+The security audit trail must be append-only and tamper-evident — no in-process code should be able to erase or edit history without detection.
+
+#### What's the problem?
+`glc/audit/store.py` was "append-only" only at the application layer (the `AuditStore` class exposes no delete). The underlying SQLite file had no integrity protection, so any in-process code opened it directly and wiped the whole history — with no error and no record:
+
+```pycon
+>>> import os, sqlite3
+>>> p = os.path.join(os.getenv("GLC_CONFIG_DIR","."), "audit.sqlite")
+>>> sqlite3.connect(p).execute("SELECT COUNT(*) FROM audit_log").fetchone()
+(3,)
+>>> con = sqlite3.connect(p); con.execute("DELETE FROM audit_log"); con.commit()
+<sqlite3.Cursor object at 0x10335f840>
+>>> sqlite3.connect(p).execute("SELECT COUNT(*) FROM audit_log").fetchone()
+(0,)
+```
+
+#### Root cause
+The append-only guarantee lived only in the Python class; the file on disk had no hash-chain and no external anchor, so a direct `DELETE`/`UPDATE` left an empty, trivially-consistent table.
+
+#### Solution
+Each row is now **hash-chained** — `row_hash = sha256(prev_hash + row_content)` — and a separate `audit_head` anchor records the expected tail; each head is also emitted to the server log (off-box and append-only on Modal). `verify_chain()` walks the table and flags any edit (row-hash mismatch), mid-sequence deletion (broken link), or full wipe (row count below the anchor). A direct `DELETE` still runs — a shared process can always touch the file — but it is no longer silent: it is **detected**.
+
+- Files touched: `glc/audit/schema.sql`, `glc/audit/store.py`, `tests/test_inprocess_leaks.py`.
+
+After the fix — the same `DELETE` is now caught:
+
+```pycon
+>>> from glc.audit import store as audit
+>>> audit.verify_chain()          # a healthy chain
+{'rows': 3, 'expected': 3, 'ok': True, 'reason': 'chain intact'}
+>>> # ... attacker runs DELETE FROM audit_log ...
+>>> audit.verify_chain()
+{'rows': 0, 'expected': 3, 'ok': False, 'reason': 'row count 0 != expected 3 (rows deleted)'}
+```
+
+## 6. Install token stored in a readable file
+
+#### Invariant broken
+The control-plane install token is a gateway-only secret; no in-process code should be able to read it and act on the control plane.
+
+#### What's the problem?
+`get_or_create_install_token()` (`glc/config.py`) generated the token and wrote it to a file on disk, so any in-process code read it straight off the filesystem:
+
+```pycon
+>>> import os
+>>> p = os.path.join(os.getenv("GLC_CONFIG_DIR","."), "install_token")
+>>> print(open(p).read()[:6] + "...")
+uyCUcW...
+```
+
+#### Root cause
+The token was persisted to a world-in-process-readable file, rather than injected as a secret the way the deployment already handles provider keys.
+
+#### Solution
+The token is now taken from an injected Secret (`GLC_INSTALL_TOKEN`) when present, and **never written to disk** in that case. On Modal it is bound as a Secret to the gateway container only, so the file the repro reads does not exist. (Local dev with no Secret still falls back to the on-disk token, so nothing breaks.)
+
+- Files touched: `glc/config.py`, `modal_app.py` (bind `glc-install-token` to the gateway), `tests/test_inprocess_leaks.py`.
+
+After the fix — with the Secret set, the file read fails:
+
+```pycon
+>>> import os
+>>> p = os.path.join(os.getenv("GLC_CONFIG_DIR","."), "install_token")
+>>> open(p).read()
+Traceback (most recent call last):
+  ...
+FileNotFoundError: [Errno 2] No such file or directory: '.../install_token'
+```
+
+## 7. In-process access to gateway internals (requires process isolation)
+
+#### Invariant broken
+Untrusted in-process code (a tool, a compromised adapter) must not be able to escalate its own trust, kill the gateway, or forge the cost ledger.
+
+#### What's the problem?
+Three more in-process leaks share one root and one fix — they cannot be closed by a code patch in a shared interpreter, only by process/container isolation:
+
+- **Escalate to owner** — `glc/security/pairing.py` exposes `force_pair_owner()`, so in-process code grants itself `owner_paired`:
+  ```pycon
+  >>> from glc.security.pairing import get_pairing_store
+  >>> get_pairing_store().force_pair_owner("telegram", "attacker-id", user_handle="me")
+  PairingRecord(channel='telegram', channel_user_id='attacker-id', ..., trust_level='owner_paired', ...)
+  ```
+- **Kill the gateway from inside** — the remote kill is loopback-blocked, but in-process code signals the process directly:
+  ```console
+  $ python3 -c "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"; echo "exit: $?"
+  exit: 143
+  ```
+- **Poison the cost ledger** — `glc/db.py`'s `log_call()` is callable in-process and validates nothing:
+  ```pycon
+  >>> import glc.db
+  >>> glc.db.log_call(provider="gemini", model="x", input_tokens=999999999, agent="victim")
+  ```
+
+#### Root cause
+All three are inherent to sharing one Python process and PID: any code can import and call a module's functions (`force_pair_owner`, `log_call`), and a process can signal itself. `force_pair_owner` also cannot simply be removed — it is the legitimate owner-bootstrap used by every channel adapter and 40+ tests.
+
+#### Solution
+The genuine fix is **Move 2** — the container/process isolation [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) calls "the assignment": run untrusted adapter/tool code in a separate container/PID namespace from the gateway core, so the pairing store, the process, and the cost-ledger writer sit behind a boundary it cannot reach (the same direction as Finding 4's broker). Specifically: the pairing store and a signed cost-ledger writer move behind the process boundary; a separate PID namespace stops the self-kill. This is an environmental/architectural layer, not an application patch — a shared process cannot prevent these, so no code change here would be an honest fix.
+
 <!--
 ## N. <finding title>
 

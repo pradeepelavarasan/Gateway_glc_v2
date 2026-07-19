@@ -43,7 +43,23 @@ def install_token_path() -> Path:
 
 def get_or_create_install_token() -> str:
     """Per-installation token used to authenticate WS adapter connections
-    and /v1/control/* requests. Generated once and persisted to disk."""
+    and /v1/control/* requests.
+
+    Prefers an injected Secret (GLC_INSTALL_TOKEN) — on Modal this is bound only
+    to the gateway container, and when present the token is NEVER written to
+    disk, so in-process code cannot read it from a file. Only when the Secret is
+    absent (local dev) do we fall back to the generated on-disk token.
+    """
+    env_tok = os.getenv("GLC_INSTALL_TOKEN")
+    if env_tok:
+        # Remove any stale on-disk token (e.g. from a pre-Secret deploy) so it
+        # cannot be read in-process from the file.
+        try:
+            install_token_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+        return env_tok.strip()
+
     p = install_token_path()
     if p.exists():
         return p.read_text().strip()

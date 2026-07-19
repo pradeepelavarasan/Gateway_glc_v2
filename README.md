@@ -25,6 +25,9 @@ Below is the list of issues that have been fixed so far. For the full write-up o
 | 2 | SSRF via the image URL resolver | Image URLs are validated before fetch — internal/private/loopback ranges blocked (IPv4 + IPv6), redirects re-checked, connection pinned to the resolved IP, plus an optional host allowlist |
 | 3 | Verbose upstream errors | Provider failures return a generic message to the client; the raw upstream detail (provider, endpoint, response body) is kept in server-side logs only |
 | 4 | Provider keys readable by any in-process code | Keys isolated in a separate broker container; the gateway holds none and delegates each call via a short-lived, provider-scoped capability token |
+| 5 | Audit log erasable by in-process code | Audit log is hash-chained with a tail anchor; any edit, deletion, or full wipe is detected by `verify_chain()` |
+| 6 | Install token stored in a readable file | Token taken from an injected Secret (gateway-only) and never written to disk, so in-process code can't read it from a file |
+| 7 | In-process access to gateway internals (escalate / self-kill / forge ledger) | Requires the Move-2 process/container isolation the architecture calls "the assignment" — documented; a shared process can't prevent these in code |
 
 ## Run it locally
 
@@ -62,6 +65,10 @@ uv run modal secret create glc-llm-keys \
 uv run modal secret create glc-broker-sign \
   GLC_BROKER_SIGN_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 
+# one-time: the install/control token, bound as a Secret so it's never a readable file
+uv run modal secret create glc-install-token \
+  GLC_INSTALL_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+
 # deploy (the data volume is created automatically on first deploy)
 uv run modal deploy modal_app.py
 
@@ -70,6 +77,9 @@ curl <deployment-url>/healthz
 
 # confirm the isolation: the gateway container holds no provider keys
 uv run modal run modal_app.py::check_gateway_env
+
+# confirm the in-process fixes: no token file, and a tampered audit log is detected
+uv run modal run modal_app.py::check_inprocess_fixes
 ```
 
 The deployment scales to zero when idle, so it stays free-tier by default.
