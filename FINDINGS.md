@@ -161,7 +161,7 @@ A provider API key is a gateway-only secret. No component that merely runs *insi
 #### What's the problem?
 Every provider key is injected into the gateway container's environment, and the gateway reads them from `os.environ`. But wrapping the monolith on Modal put the whole gateway — providers, channel adapters, voice adapters, tools — in one container sharing one secret, so any code in the process can read every key straight from `os.environ`. The keys are not isolated from the components that should never hold them.
 
-Reproduced from a fresh checkout (`repro/leak1_provider_keys.py`) — the gateway boots, then a stand-in adapter running in the same process dumps every key (mock values, per the assignment's mock-keys rule):
+Reproduced from a fresh checkout (`repro/leak1_provider_keys.py`) — the gateway boots, then a stand-in adapter running in the same process dumps every key (mock values used here; never put real provider keys in a shared environment like this):
 
 ```console
 $ uv run python repro/leak1_provider_keys.py
@@ -315,7 +315,7 @@ Three more in-process leaks share one root and one fix — they cannot be closed
 All three are inherent to sharing one Python process and PID: any code can import and call a module's functions (`force_pair_owner`, `log_call`), and a process can signal itself. `force_pair_owner` also cannot simply be removed — it is the legitimate owner-bootstrap used by every channel adapter and 40+ tests.
 
 #### Solution
-The genuine fix is **Move 2** — the container/process isolation [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) calls "the assignment": run untrusted adapter/tool code in a separate container/PID namespace from the gateway core, so the pairing store, the process, and the cost-ledger writer sit behind a boundary it cannot reach (the same direction as Finding 4's broker). Specifically: the pairing store and a signed cost-ledger writer move behind the process boundary; a separate PID namespace stops the self-kill. This is an environmental/architectural layer, not an application patch — a shared process cannot prevent these, so no code change here would be an honest fix.
+The genuine fix is process/container isolation: run untrusted adapter and tool code in a separate container (and PID namespace) from the gateway core, so the pairing store, the gateway process itself, and the cost-ledger writer sit behind a boundary that in-process code cannot reach — the same direction as Finding 4's broker split. Concretely: the pairing store and a signed cost-ledger writer move behind that process boundary, and a separate PID namespace stops the self-kill. This is an environmental/architectural layer, not an application patch — a shared process cannot prevent these, so a code change here would not be an honest fix.
 
 <!--
 ## N. <finding title>
