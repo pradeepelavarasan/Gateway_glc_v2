@@ -28,33 +28,51 @@ app = modal.App("glc-v1-gateway")
 
 LOCAL_GLC = Path(__file__).parent / "glc"
 
-_base = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "fastapi>=0.110",
-    "uvicorn[standard]>=0.27",
-    "httpx>=0.27",
-    "python-dotenv>=1.0",
-    "pydantic>=2.6",
-    "jsonschema>=4.21",
-    "pyyaml>=6.0",
-    "websockets>=12.0",
-    "twilio>=9.0",
+# Pinned by digest (python:3.11-slim, resolved 2026-07-19) rather than a rolling
+# tag, so the base layer can't shift under us between builds. Dependencies come
+# from uv.lock via uv_sync(frozen=True) instead of a hand-copied pip_install
+# list, so the image can't silently drift from what's actually locked and
+# tested — a typosquatted or bumped transitive dependency can't enter quietly.
+_PYTHON_SLIM_PINNED = (
+    "python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"
 )
+_base = modal.Image.from_registry(_PYTHON_SLIM_PINNED).uv_sync()
 
 # `.env(...)` must come before `.add_local_dir(...)`, which has to be the last
-# build step. The broker uses a container-local config dir (no shared volume);
-# the gateway keeps the persistent volume and runs in remote-broker mode.
+# build step. The broker uses a container-local config dir (no shared volume).
+# GLC_BROKER=sandbox: chat/router calls go through per-provider Sandboxes with
+# an egress allowlist (glc/security/broker.py SandboxBroker) — A3 + A4
+# combined. embed/stt/tts still go through the Function-based broker_exec_*
+# below (RemoteBroker), which the Sandbox path is composed with.
 broker_image = _base.env({"GLC_CONFIG_DIR": "/tmp/glc"}).add_local_dir(str(LOCAL_GLC), remote_path="/root/glc")
-gateway_image = _base.env({"GLC_CONFIG_DIR": "/data/glc", "GLC_BROKER": "remote"}).add_local_dir(
+gateway_image = _base.env({"GLC_CONFIG_DIR": "/data/glc", "GLC_BROKER": "sandbox"}).add_local_dir(
     str(LOCAL_GLC), remote_path="/root/glc"
 )
 
 data_volume = modal.Volume.from_name("glc-data", create_if_missing=True)
-llm_secret = modal.Secret.from_name("glc-llm-keys")  # provider keys — broker only
-sign_secret = modal.Secret.from_name("glc-broker-sign")  # token-signing key — both
+sign_secret = modal.Secret.from_name("glc-broker-sign")  # token-signing key — all broker/gateway functions
 install_token_secret = modal.Secret.from_name("glc-install-token")  # control token — gateway only
 
+# Per-slot Secrets: each LLM provider gets its own Secret holding only its own
+# key, so a compromised broker_exec_<provider> container never had the other
+# five keys in its environment. embed/stt/tts still run against the full
+# bundle (glc-llm-keys) via broker_exec_shared — see FINDINGS.md for the scope
+# note on that residual gap.
+from glc.security.broker import LLM_PROVIDERS  # noqa: E402
 
-# ── broker: the only container that holds provider keys ──────────────────────
+_PROVIDER_SECRET_NAME = {
+    "gemini": "glc-key-gemini",
+    "nvidia": "glc-key-nvidia",
+    "groq": "glc-key-groq",
+    "cerebras": "glc-key-cerebras",
+    "openrouter": "glc-key-openrouter",
+    "github": "glc-key-github",
+}
+provider_secrets = {p: modal.Secret.from_name(_PROVIDER_SECRET_NAME[p]) for p in LLM_PROVIDERS}
+llm_secret = modal.Secret.from_name("glc-llm-keys")  # full bundle — broker_exec_shared only
+
+
+# ── broker: the only containers that hold provider keys ──────────────────────
 
 # Built once per warm container.
 _broker = None
@@ -70,12 +88,13 @@ def _get_broker():
     return _broker
 
 
-@app.function(image=broker_image, secrets=[llm_secret, sign_secret], min_containers=0)
-async def broker_exec(kind: str, payload: dict, provider: str | None = None, token: str = ""):
-    """Execute one keyed call inside the broker container (which holds the keys).
+async def _broker_exec_handler(kind: str, payload: dict, provider: str | None = None, token: str = ""):
+    """Execute one keyed call inside a broker container.
 
     `__enabled__` reports provider descriptors (no secret leaves the broker);
-    every other kind requires a valid, provider-scoped capability token.
+    every other kind requires a valid, provider-scoped capability token. This
+    same handler body backs every broker_exec_* function below — only the
+    Secret each is deployed with differs.
     """
     if kind == "__enabled__":
         return await _get_broker().enabled(payload["kind"])
@@ -83,6 +102,24 @@ async def broker_exec(kind: str, payload: dict, provider: str | None = None, tok
 
     verify(token, provider=provider or kind, purpose=kind)
     return await _get_broker().call(kind, payload, provider=provider)
+
+
+# One function per provider, each with only that provider's own Secret.
+for _p in LLM_PROVIDERS:
+    app.function(
+        image=broker_image,
+        secrets=[provider_secrets[_p], sign_secret],
+        min_containers=0,
+        name=f"broker_exec_{_p}",
+    )(_broker_exec_handler)
+
+# embed/stt/tts — still the full key bundle (residual scope, documented).
+broker_exec_shared = app.function(
+    image=broker_image,
+    secrets=[llm_secret, sign_secret],
+    min_containers=0,
+    name="broker_exec_shared",
+)(_broker_exec_handler)
 
 
 # ── gateway: public app, no provider keys ────────────────────────────────────
@@ -94,16 +131,54 @@ async def broker_exec(kind: str, payload: dict, provider: str | None = None, tok
     # broker-signing key + the install token as a Secret (never a file); NO provider keys
     secrets=[sign_secret, install_token_secret],
     min_containers=0,  # scale to zero when idle -> protects the free tier
+    # The audit/pairing/gateway SQLite databases live on this Volume. SQLite
+    # doesn't arbitrate concurrent writers across separate containers, so this
+    # gateway is pinned to exactly one container — a second writer would corrupt
+    # the files and split the audit trail (see FINDINGS.md).
+    max_containers=1,
 )
 @modal.asgi_app()
 def fastapi_app():
     """Serve the glc gateway. Provider keys are absent here — LLM/embed/voice
     calls are delegated to broker_exec via RemoteBroker."""
+    import asyncio
     import os
+    from contextlib import asynccontextmanager
 
     os.makedirs("/data/glc", exist_ok=True)
 
     from glc.main import app as web
+
+    # Volume writes aren't durable or visible elsewhere until committed. With a
+    # single container (max_containers=1, above) there's no cross-container
+    # visibility problem, but an uncommitted write is still lost if this
+    # container is evicted/restarted — so commit periodically and on graceful
+    # shutdown rather than relying on implicit background commit. Wraps the
+    # app's existing lifespan rather than using FastAPI's deprecated on_event.
+    inner_lifespan = web.router.lifespan_context
+
+    @asynccontextmanager
+    async def _lifespan_with_commit(app):
+        async def _commit_loop():
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    data_volume.commit()
+                except Exception as e:
+                    print(f"[glc] volume commit failed: {e!r}")
+
+        async with inner_lifespan(app):
+            task = asyncio.create_task(_commit_loop())
+            try:
+                yield
+            finally:
+                task.cancel()
+                try:
+                    data_volume.commit()
+                except Exception as e:
+                    print(f"[glc] final volume commit failed: {e!r}")
+
+    web.router.lifespan_context = _lifespan_with_commit
     return web
 
 
@@ -134,15 +209,47 @@ def check_gateway_env() -> dict:
 
 @app.function(image=broker_image, secrets=[llm_secret, sign_secret])
 def check_broker_env() -> dict:
-    """Runs the same snippet in the BROKER's secret config — the only container
-    that holds the provider keys. Every value should be True."""
+    """Runs the same snippet in broker_exec_shared's secret config (the full
+    key bundle, used for embed/stt/tts). Every value should be True."""
     import os
 
     present = {k: (os.environ.get(k) is not None) for k in _PROVIDER_KEYS}
-    print("[broker container] provider keys present:")
+    print("[broker_exec_shared] provider keys present:")
     for k, v in present.items():
         print(f"    {k} = {v}")
     return present
+
+
+_PROVIDER_ENV_VAR = {
+    "gemini": "GEMINI_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "cerebras": "CEREBRAS_API_KEY",
+    "openrouter": "OPEN_ROUTER_API_KEY",
+    "github": "GITHUB_ACCESS_TOKEN",
+}
+
+def _check_provider_env_handler() -> dict:
+    """Per-slot proof (A4): this container should hold ONLY its own provider's
+    key — every other provider's key must be absent. Registered under six
+    names below (one per provider); which key is True identifies which
+    provider's container answered. A top-level, parameterless function (not a
+    closure) because @app.function requires global-scope functions."""
+    import os
+
+    present = {k: (os.environ.get(k) is not None) for k in _PROVIDER_KEYS}
+    print("[broker_exec_<provider>] provider keys present:")
+    for k, v in present.items():
+        print(f"    {k} = {v}")
+    return present
+
+
+for _p in LLM_PROVIDERS:
+    app.function(
+        image=broker_image,
+        secrets=[provider_secrets[_p], sign_secret],
+        name=f"check_provider_env_{_p}",
+    )(_check_provider_env_handler)
 
 
 @app.function(image=gateway_image, volumes={"/data": data_volume}, secrets=[sign_secret, install_token_secret])

@@ -28,6 +28,12 @@ Below is the list of issues that have been fixed so far. For the full write-up o
 | 5 | Audit log erasable by in-process code | Audit log is hash-chained with a tail anchor; any edit, deletion, or full wipe is detected by `verify_chain()` |
 | 6 | Install token stored in a readable file | Token taken from an injected Secret (gateway-only) and never written to disk, so in-process code can't read it from a file |
 | 7 | In-process access to gateway internals (escalate / self-kill / forge ledger) | Requires process/container isolation between the gateway core and adapter/tool code — documented; a shared process can't prevent these in code |
+| 8 | Unbounded network egress (single Function, no egress wall) | Chat/router calls run in per-provider Sandboxes with an `outbound_domain_allowlist` restricted to that provider's own API host |
+| 9 | One Secret for the whole Function (provider keys not per-slot) | Each LLM provider now has its own Secret and its own Sandbox — a compromised sandbox never holds any other provider's key |
+| 10 | Non-reproducible image | Base image pinned by digest; dependencies built from `uv.lock` via `Image.uv_sync()` instead of a hand-copied, loosely-versioned list |
+| 11 | Audit volume assumes one writer | Gateway pinned to a single container (`max_containers=1`); the Volume is committed periodically and on shutdown |
+| 12 | Cross-channel envelope spoofing | The WS handler now rejects and closes the socket on any envelope whose `channel` doesn't match the route it arrived on |
+| 13 | Unrestricted subprocess and shell access | Not code-fixed — documented; needs a coordinated non-root/path migration across the now-working gateway, broker, and Sandbox images |
 
 ## Run it locally
 

@@ -66,6 +66,23 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
                 await websocket.send_text(json.dumps({"error": f"invalid envelope: {e}"}))
                 continue
 
+            # An adapter connected on /v1/channels/<name> must not be able to
+            # claim a different channel in the envelope — that would let it
+            # impersonate another channel's trust/allowlist/pairing rules.
+            if env.channel != name:
+                audit_append(
+                    channel=name,
+                    channel_user_id=env.channel_user_id,
+                    trust_level=env.trust_level,
+                    event_type="channel_spoof_attempt",
+                    result={"route": name, "envelope_channel": env.channel},
+                )
+                await websocket.send_text(
+                    json.dumps({"error": f"envelope channel {env.channel!r} does not match route {name!r}"})
+                )
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
             ok, why = allowed(
                 env.channel,
                 env.channel_user_id,
